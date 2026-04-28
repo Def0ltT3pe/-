@@ -15,6 +15,9 @@ import queue
 import json
 import os
 import socket
+import sqlite3
+import time
+import urllib.request
 from datetime import datetime
 import ipaddress
 
@@ -39,6 +42,35 @@ def parse_targets(target_str: str):
             except ValueError:
                 raise ValueError(f"Некорректный адрес или сеть: {part}")
     return targets
+
+
+def parse_ports(port_str: str):
+    """Разбирает список портов вида 80,443,1000-1010 в валидированный список."""
+    ports = []
+    for part in port_str.split(','):
+        part = part.strip()
+        if not part:
+            continue
+
+        if '-' in part:
+            try:
+                start, end = map(int, part.split('-', 1))
+            except ValueError:
+                raise ValueError(f"Некорректный диапазон портов: {part}")
+            if start > end:
+                raise ValueError(f"Начало диапазона больше конца: {part}")
+            if not (1 <= start <= 65535 and 1 <= end <= 65535):
+                raise ValueError(f"Порты должны быть в диапазоне 1-65535: {part}")
+            ports.extend(range(start, end + 1))
+        else:
+            try:
+                port = int(part)
+            except ValueError:
+                raise ValueError(f"Некорректный порт: {part}")
+            if not (1 <= port <= 65535):
+                raise ValueError(f"Порт вне диапазона 1-65535: {port}")
+            ports.append(port)
+    return ports
 
 
 # ==============================================================================
@@ -137,6 +169,106 @@ class ScanHistoryManager:
         return False
 
 
+class RequestHistoryManager:
+    """Хранение истории сетевых запросов в SQLite."""
+
+    def __init__(self, filename='request_history.db'):
+        self.filename = filename
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.filename) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS request_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    request_type TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    payload TEXT,
+                    status TEXT NOT NULL,
+                    response_time_ms INTEGER,
+                    response_preview TEXT
+                )
+            """)
+            conn.commit()
+
+    def add_entry(self, request_type, target, payload, status, response_time_ms, response_preview):
+        with sqlite3.connect(self.filename) as conn:
+            conn.execute("""
+                INSERT INTO request_history (
+                    created_at, request_type, target, payload, status, response_time_ms, response_preview
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now().isoformat(timespec='seconds'),
+                request_type,
+                target,
+                payload,
+                status,
+                response_time_ms,
+                response_preview
+            ))
+            conn.commit()
+
+    def list_entries(self):
+        with sqlite3.connect(self.filename) as conn:
+            cursor = conn.execute("""
+                SELECT id, created_at, request_type, target, payload, status, response_time_ms, response_preview
+                FROM request_history
+                ORDER BY id DESC
+            """)
+            rows = cursor.fetchall()
+        return rows
+
+    def clear(self):
+        with sqlite3.connect(self.filename) as conn:
+            conn.execute("DELETE FROM request_history")
+            conn.commit()
+
+
+class RequestWorker(threading.Thread):
+    """Фоновый поток для выполнения одиночного сетевого запроса."""
+
+    def __init__(self, request_type, target, payload, result_queue):
+        super().__init__(daemon=True)
+        self.request_type = request_type
+        self.target = target
+        self.payload = payload
+        self.result_queue = result_queue
+
+    def run(self):
+        started = time.perf_counter()
+        status, preview = self._execute()
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        self.result_queue.put(('request_finished', self.request_type, self.target, self.payload, status, elapsed_ms, preview))
+
+    def _execute(self):
+        try:
+            if self.request_type == "DNS":
+                host, aliases, ips = socket.gethostbyname_ex(self.target.strip())
+                preview = f"host={host}; aliases={aliases}; ips={ips}"
+                return "ok", preview
+
+            if self.request_type == "HTTP":
+                url = self.target.strip()
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    url = "http://" + url
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    body = resp.read(180).decode("utf-8", errors="replace").strip().replace("\n", " ")
+                    preview = f"HTTP {resp.status}; {body[:150]}"
+                    return "ok", preview
+
+            if self.request_type == "TCP":
+                host = self.target.strip()
+                port = int(self.payload.strip() or "80")
+                with socket.create_connection((host, port), timeout=3):
+                    return "ok", f"TCP connect success to {host}:{port}"
+
+            return "error", "Неизвестный тип запроса"
+        except Exception as e:
+            return "error", str(e)
+
+
 # ==============================================================================
 # Графический интерфейс пользователя
 # ==============================================================================
@@ -148,39 +280,60 @@ class PortScannerApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Анализатор портов")
-        self.root.geometry("950x650")
+        self.root.title("Анализатор сети")
+        self.root.geometry("1100x730")
         self.root.resizable(True, True)
-        self.root.configure(bg='#d3d3d3')
+        self.root.configure(bg='#eef2f7')
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # Стили
         self.style = ttk.Style()
         self.style.theme_use('clam')
-        self.style.configure("TFrame", background='#d3d3d3')
-        self.style.configure("TLabel", background='#d3d3d3', font=("Segoe UI", 10))
-        self.style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6)
-        self.style.configure("Treeview.Heading", font=("Segoe UI", 11, "bold"))
-        self.style.configure("Treeview", font=("Segoe UI", 10), rowheight=25)
-        self.style.map("TButton", background=[("active", "#b0b0b0")])
+        self.style.configure("TFrame", background='#eef2f7')
+        self.style.configure("TLabel", background='#eef2f7', foreground='#111827', font=("Segoe UI", 10))
+        self.style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=(10, 7))
+        self.style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(10, 7),
+                             foreground='white', background='#2563eb')
+        self.style.map("Primary.TButton", background=[("active", "#1d4ed8"), ("pressed", "#1e40af")])
+        self.style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"),
+                             background="#e5e7eb", foreground="#111827")
+        self.style.configure("Treeview", font=("Segoe UI", 10), rowheight=28,
+                             background="white", fieldbackground="white", foreground="#111827")
+        self.style.configure("TNotebook", background='#eef2f7', borderwidth=0)
+        self.style.configure("TNotebook.Tab", padding=(16, 8), font=("Segoe UI", 10, "bold"))
+        self.style.map("TNotebook.Tab",
+                       background=[("selected", "white"), ("!selected", "#dbe4f0")],
+                       foreground=[("selected", "#111827"), ("!selected", "#4b5563")])
+        self.style.configure("Accent.Horizontal.TProgressbar", troughcolor="#dbeafe", background="#2563eb")
 
         # История
         self.history_manager = ScanHistoryManager()
+        self.request_history_manager = RequestHistoryManager()
 
         # Переменные сканирования
         self.current_results = []
         self.scanner_thread = None
         self.result_queue = queue.Queue()
         self.scan_in_progress = False
+        self.request_in_progress = False
+        self.request_thread = None
+        self.request_queue = queue.Queue()
 
         self.create_widgets()
         self.refresh_history_list()
+        self.refresh_request_history()
         self.poll_queue()
+        self.poll_request_queue()
 
     # --------------------------------------------------------------------------
     def create_widgets(self):
+        header = ttk.Frame(self.root)
+        header.pack(fill=tk.X, padx=16, pady=(14, 8))
+        ttk.Label(header, text="Network Analyzer", font=("Segoe UI", 16, "bold")).pack(anchor=tk.W)
+        ttk.Label(header, text="Сканирование портов, запросы DNS/HTTP/TCP и история", foreground="#4b5563").pack(anchor=tk.W)
+
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
 
         # ======================== Вкладка Сканирование ========================
         self.scan_frame = ttk.Frame(self.notebook)
@@ -215,7 +368,7 @@ class PortScannerApp:
         btn_frame = ttk.Frame(self.scan_frame)
         btn_frame.grid(row=2, column=0, columnspan=4, pady=10, sticky=tk.W)
 
-        self.start_btn = ttk.Button(btn_frame, text="▶ Сканировать", command=self.start_scan)
+        self.start_btn = ttk.Button(btn_frame, text="▶ Сканировать", command=self.start_scan, style="Primary.TButton")
         self.start_btn.pack(side=tk.LEFT, padx=5)
 
         self.stop_btn = ttk.Button(btn_frame, text="⏹ Остановить", command=self.stop_scan, state=tk.DISABLED)
@@ -228,7 +381,8 @@ class PortScannerApp:
 
         # Прогресс
         self.progress_var = tk.IntVar()
-        self.progress = ttk.Progressbar(self.scan_frame, variable=self.progress_var, maximum=100)
+        self.progress = ttk.Progressbar(self.scan_frame, variable=self.progress_var, maximum=100,
+                                        style="Accent.Horizontal.TProgressbar")
         self.progress.grid(row=3, column=0, columnspan=4, sticky=tk.EW, padx=5, pady=5)
 
         # Таблица результатов
@@ -261,6 +415,89 @@ class PortScannerApp:
         hist_right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         self.hist_tree = self._create_result_table(hist_right)
+
+        # ======================== Вкладка Запросы ============================
+        self.request_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.request_frame, text="Запросы")
+
+        ttk.Label(self.request_frame, text="Тип запроса:").grid(
+            row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.request_type = tk.StringVar(value="DNS")
+        self.request_type_box = ttk.Combobox(
+            self.request_frame,
+            textvariable=self.request_type,
+            values=("DNS", "HTTP", "TCP"),
+            state="readonly",
+            width=10
+        )
+        self.request_type_box.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(self.request_frame, text="Цель (host/url):").grid(
+            row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.request_target_entry = tk.Entry(self.request_frame, **entry_kwargs)
+        self.request_target_entry.insert(0, "example.com")
+        self.request_target_entry.grid(row=1, column=1, columnspan=3, sticky=tk.W, padx=5, pady=5)
+        self._add_context_menu_to_entry(self.request_target_entry)
+
+        ttk.Label(self.request_frame, text="Параметр (для TCP: порт):").grid(
+            row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        self.request_payload_entry = tk.Entry(self.request_frame, **entry_kwargs)
+        self.request_payload_entry.insert(0, "80")
+        self.request_payload_entry.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=5, pady=5)
+        self._add_context_menu_to_entry(self.request_payload_entry)
+
+        req_btn_frame = ttk.Frame(self.request_frame)
+        req_btn_frame.grid(row=3, column=0, columnspan=4, sticky=tk.W, padx=5, pady=8)
+
+        self.request_btn = ttk.Button(req_btn_frame, text="▶ Выполнить запрос", command=self.start_request,
+                                      style="Primary.TButton")
+        self.request_btn.pack(side=tk.LEFT, padx=5)
+
+        self.clear_request_history_btn = ttk.Button(
+            req_btn_frame, text="🧹 Очистить историю запросов", command=self.clear_request_history
+        )
+        self.clear_request_history_btn.pack(side=tk.LEFT, padx=5)
+
+        self.export_request_history_btn = ttk.Button(
+            req_btn_frame, text="📤 Экспорт истории запросов", command=self.export_request_history
+        )
+        self.export_request_history_btn.pack(side=tk.LEFT, padx=5)
+
+        self.request_status_var = tk.StringVar(value="Ожидание запроса...")
+        ttk.Label(self.request_frame, textvariable=self.request_status_var).grid(
+            row=4, column=0, columnspan=4, sticky=tk.W, padx=5, pady=5)
+
+        request_columns = ("created_at", "type", "target", "status", "time", "preview")
+        self.request_history_tree = ttk.Treeview(
+            self.request_frame, columns=request_columns, show="headings", height=14
+        )
+        headings = {
+            "created_at": "Время",
+            "type": "Тип",
+            "target": "Цель",
+            "status": "Статус",
+            "time": "Время, мс",
+            "preview": "Ответ"
+        }
+        for c in request_columns:
+            self.request_history_tree.heading(c, text=headings[c])
+        self.request_history_tree.column("created_at", width=145, anchor="center")
+        self.request_history_tree.column("type", width=70, anchor="center")
+        self.request_history_tree.column("target", width=180, anchor="w")
+        self.request_history_tree.column("status", width=80, anchor="center")
+        self.request_history_tree.column("time", width=90, anchor="center")
+        self.request_history_tree.column("preview", width=420, anchor="w")
+        self.request_history_tree.grid(row=5, column=0, columnspan=4, sticky=tk.NSEW, padx=5, pady=5)
+
+        request_scroll = ttk.Scrollbar(self.request_frame, orient=tk.VERTICAL, command=self.request_history_tree.yview)
+        self.request_history_tree.configure(yscrollcommand=request_scroll.set)
+        request_scroll.grid(row=5, column=4, sticky=tk.NS)
+
+        self.request_frame.rowconfigure(5, weight=1)
+        self.request_frame.columnconfigure(3, weight=1)
+
+        self.status_var = tk.StringVar(value="Готово к работе")
+        ttk.Label(self.root, textvariable=self.status_var, foreground="#4b5563").pack(fill=tk.X, padx=16, pady=(0, 10))
 
     # --------------------------------------------------------------------------
     def _add_context_menu_to_entry(self, entry_widget):
@@ -377,20 +614,13 @@ class PortScannerApp:
                                    f"Максимум {self.MAX_TARGETS} IP-адресов (сейчас {len(targets)}).")
             return
 
-        ports = []
         port_str = self.port_entry.get().strip()
-        for part in port_str.split(','):
-            part = part.strip()
-            if '-' in part:
-                start, end = map(int, part.split('-'))
-                ports.extend(range(start, end + 1))
-            else:
-                if part:
-                    port = int(part)
-                    if not (1 <= port <= 65535):
-                        messagebox.showerror("Ошибка", f"Некорректный порт: {port}")
-                        return
-                    ports.append(port)
+        try:
+            ports = parse_ports(port_str)
+        except ValueError as e:
+            messagebox.showerror("Ошибка", str(e))
+            return
+
         if not ports:
             messagebox.showerror("Ошибка", "Укажите хотя бы один порт")
             return
@@ -425,6 +655,24 @@ class PortScannerApp:
         self.stop_btn.config(state=tk.DISABLED)
         self.scan_in_progress = False
 
+    def start_request(self):
+        if self.request_in_progress:
+            return
+        request_type = self.request_type.get().strip()
+        target = self.request_target_entry.get().strip()
+        payload = self.request_payload_entry.get().strip()
+        if not target:
+            messagebox.showerror("Ошибка", "Укажите цель запроса")
+            return
+
+        self.request_in_progress = True
+        self.request_btn.config(state=tk.DISABLED)
+        self.request_status_var.set(f"Выполняется {request_type}-запрос к {target} ...")
+        self.status_var.set(f"Выполняется {request_type}-запрос к {target}")
+
+        self.request_thread = RequestWorker(request_type, target, payload, self.request_queue)
+        self.request_thread.start()
+
     # --------------------------------------------------------------------------
     def poll_queue(self):
         try:
@@ -437,6 +685,7 @@ class PortScannerApp:
                     self.current_results.append({'host': ip, 'port': port, 'state': state})
                     self.progress_var.set(current)
                     self.progress.config(maximum=total)
+                    self.status_var.set(f"Сканирование: {current}/{total}")
 
                 elif msg[0] == 'finished':
                     self.scan_in_progress = False
@@ -449,11 +698,30 @@ class PortScannerApp:
                             self.current_results
                         )
                         self.refresh_history_list()
+                    self.status_var.set("Сканирование завершено")
                     messagebox.showinfo("Готово", "Сканирование завершено")
         except queue.Empty:
             pass
         if self.scan_in_progress:
             self.root.after(100, self.poll_queue)
+
+    def poll_request_queue(self):
+        try:
+            while True:
+                msg = self.request_queue.get_nowait()
+                if msg[0] == "request_finished":
+                    _, request_type, target, payload, status, elapsed_ms, preview = msg
+                    self.request_history_manager.add_entry(request_type, target, payload, status, elapsed_ms, preview)
+                    self.refresh_request_history()
+                    human = "успешно" if status == "ok" else "с ошибкой"
+                    self.request_status_var.set(f"{request_type}-запрос завершен {human} за {elapsed_ms} мс")
+                    self.status_var.set(f"Запрос {request_type}: {human} ({elapsed_ms} мс)")
+                    self.request_btn.config(state=tk.NORMAL)
+                    self.request_in_progress = False
+        except queue.Empty:
+            pass
+
+        self.root.after(120, self.poll_request_queue)
 
     # ==========================================================================
     # Экспорт результатов
@@ -559,11 +827,68 @@ class PortScannerApp:
         menu.add_command(label="Удалить", command=self.delete_history_entry)
         menu.post(event.x_root, event.y_root)
 
+    # ==========================================================================
+    # История сетевых запросов (SQLite)
+    # ==========================================================================
+    def refresh_request_history(self):
+        for row in self.request_history_tree.get_children():
+            self.request_history_tree.delete(row)
+
+        for _, created_at, request_type, target, payload, status, response_time_ms, response_preview in self.request_history_manager.list_entries():
+            status_text = "OK" if status == "ok" else "ERROR"
+            self.request_history_tree.insert(
+                "", tk.END,
+                values=(created_at, request_type, target, status_text, response_time_ms, response_preview[:180])
+            )
+
+    def clear_request_history(self):
+        if messagebox.askyesno("Подтверждение", "Удалить всю историю сетевых запросов?"):
+            self.request_history_manager.clear()
+            self.refresh_request_history()
+            self.request_status_var.set("История запросов очищена.")
+
+    def export_request_history(self):
+        rows = self.request_history_manager.list_entries()
+        if not rows:
+            messagebox.showinfo("Нет данных", "История запросов пуста.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("CSV files", "*.csv")]
+        )
+        if not filename:
+            return
+
+        if filename.endswith(".csv"):
+            import csv
+            with open(filename, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["id", "created_at", "request_type", "target", "payload", "status", "response_time_ms", "response_preview"])
+                writer.writerows(rows)
+        else:
+            data = []
+            for row in rows:
+                data.append({
+                    "id": row[0],
+                    "created_at": row[1],
+                    "request_type": row[2],
+                    "target": row[3],
+                    "payload": row[4],
+                    "status": row[5],
+                    "response_time_ms": row[6],
+                    "response_preview": row[7]
+                })
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
     def on_closing(self):
         if self.scan_in_progress:
             self.stop_scan()
             if self.scanner_thread:
                 self.scanner_thread.join(timeout=2)
+        if self.request_in_progress and self.request_thread:
+            self.request_thread.join(timeout=2)
         self.root.destroy()
 
 
